@@ -19,7 +19,9 @@ This tool is inspired from [endlessh](https://github.com/skeeto/endlessh), while
 
 
 git clone https://github.com/TubalQ/Pandemonium.git
+
 cd Pandemonium
+
 sudo ./pandemonium
 
 
