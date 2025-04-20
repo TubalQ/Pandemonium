@@ -22,7 +22,12 @@ git clone https://github.com/TubalQ/Pandemonium.git
 
 cd Pandemonium
 
-sudo ./pandemonium
+chmod +x Pandemonium
+
+Go to /Opt/Pandemonium
+
+cd /opt/Pandemonium
+
 
 
 On first run, Pandemonium will:
