@@ -7,7 +7,7 @@ This tool is inspired from [endlessh](https://github.com/skeeto/endlessh), while
 ## Features
 
 - Endless mode: keeps connections open indefinitely.
-- Block mode: blocks repeat offenders using `iptables` after configurable threshold.
+- Block mode: blocks incoming connections with no logs
 - Full logging: stores all events to both plaintext and CSV.
 - GeoIP integration (optional): log country/city using MaxMind GeoLite2.
 - Resource limits: restrict CPU and memory usage.
