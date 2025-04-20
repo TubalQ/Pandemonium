@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+
+import subprocess
+import sys
+import asyncio
+import logging
+import csv
+import resource
+import time
+import os
+import shutil
+from datetime import datetime
+from collections import defaultdict
+
+INSTALL_DIR = "/opt/Pandemonium"
+REQUIRED_FILES = [
+    "config.txt",
+    "requirements.txt",
+    "pandemonium.log",
+    "events.csv",
+    "blocked_ips.txt",
+    "output.log"
+]
+DEFAULT_CONFIG = {
+    "PORT": "2222",
+    "MODE": "endless",
+    "DELAY": "10000",
+    "MAX_LINE_LENGTH": "32",
+    "MAX_CONNECTIONS": "3",
+    "DB": "GeoLite2-City.mmdb",
+    "LOGFILE": "pandemonium.log",
+    "CSV_LOG": "events.csv",
+    "CPU_LIMIT": "50",
+    "MEMORY_LIMIT": "100",
+    "TIMEOUT": "0",
+    "MAX_CLIENTS": "0"
+}
+
+if not os.path.exists(INSTALL_DIR):
+    os.makedirs(INSTALL_DIR)
+
+if not os.path.abspath(__file__).startswith(INSTALL_DIR):
+    target = os.path.join(INSTALL_DIR, os.path.basename(__file__))
+    shutil.copy(__file__, target)
+    print(f"Moved script to {target}. Please re-run from that location:\n  sudo {target}")
+    sys.exit(0)
+
+os.chdir(INSTALL_DIR)
+
+if not os.path.exists("config.txt"):
+    with open("config.txt", "w") as f:
+        for k, v in DEFAULT_CONFIG.items():
+            f.write(f"{k}={v}\n")
+
+if not os.path.exists("requirements.txt"):
+    with open("requirements.txt", "w") as f:
+        f.write("geoip2\n")
+
+for file in REQUIRED_FILES:
+    open(file, 'a').close()
+
+def load_config(path):
+    config = {}
+    with open(path) as f:
+        for line in f:
+            if '=' in line:
+                key, val = line.strip().split('=', 1)
+                config[key.strip()] = val.strip()
+    return config
+
+def geoip_lookup(ip, db_path):
+    try:
+        import geoip2
+        if not os.path.exists(db_path):
+            return "GeoIP DB Missing"
+        with geoip2.database.Reader(db_path) as reader:
+            response = reader.city(ip)
+            country = response.country.name
+            city = response.city.name or "Unknown"
+            return f"{country}, {city}"
+    except Exception:
+        return "Unknown"
+
+def sanitize_csv_field(field):
+    if isinstance(field, str) and field.startswith(('=', '+', '-', '@')):
+        return f"'{field}"
+    return field
+
+def log_csv(ip, location, event, config):
+    with open(config['CSV_LOG'], 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([datetime.now(), sanitize_csv_field(ip), sanitize_csv_field(location), sanitize_csv_field(event)])
+
+def apply_resource_limits(config):
+    mem_limit = int(config.get('MEMORY_LIMIT', 0))
+    if mem_limit > 0:
+        bytes_limit = mem_limit * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (bytes_limit, bytes_limit))
+
+def block_ip(ip):
+    os.system(f"iptables -A INPUT -s {ip} -j DROP")
+
+active_clients = 0
+ip_counters = defaultdict(int)
+ip_last_logged = defaultdict(float)
+blocked_ips = set()
+
+def load_blocked_ips():
+    if os.path.exists("blocked_ips.txt"):
+        with open("blocked_ips.txt", "r") as f:
+            for line in f:
+                if line.strip():
+                    parts = line.split()
+                    for p in parts:
+                        if p.count('.') == 3:
+                            blocked_ips.add(p)
+
+async def handle_client(reader, writer, config):
+    global active_clients
+
+    addr = writer.get_extra_info('peername')[0]
+    if addr in blocked_ips:
+        writer.close()
+        await writer.wait_closed()
+        return
+
+    max_clients = int(config.get('MAX_CLIENTS', 0))
+    if max_clients and active_clients >= max_clients:
+        writer.close()
+        await writer.wait_closed()
+        return
+
+    active_clients += 1
+    location = geoip_lookup(addr, config['DB'])
+
+    now = time.time()
+    if now - ip_last_logged[addr] > 3600 or ip_last_logged[addr] == 0:
+        logging.info(f"Connection from {addr} ({location})")
+        log_csv(addr, location, "Connected", config)
+        ip_last_logged[addr] = now
+
+    timeout = int(config.get('TIMEOUT', 0))
+    deadline = time.time() + timeout if timeout else None
+
+    try:
+        if config['MODE'] == 'endless':
+            while True:
+                writer.write(b"#" * int(config['MAX_LINE_LENGTH']) + b"\r\n")
+                await writer.drain()
+                await asyncio.sleep(int(config['DELAY']) / 1000)
+                if deadline and time.time() > deadline:
+                    raise asyncio.CancelledError()
+        else:
+            await asyncio.sleep(timeout) if timeout else await asyncio.sleep(10)
+    except (asyncio.CancelledError, ConnectionResetError):
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        if config['MODE'] == 'block':
+            ip_counters[addr] += 1
+            max_conn = int(config.get('MAX_CONNECTIONS', 0))
+            logging.info(f"[BLOCK MODE] {addr} has {ip_counters[addr]} connections (limit: {max_conn})")
+            if max_conn > 0 and ip_counters[addr] >= max_conn:
+                block_ip(addr)
+                blocked_ips.add(addr)
+                log_csv(addr, location, "Blocked", config)
+                with open("blocked_ips.txt", "a") as f:
+                    f.write(f"{datetime.now()} - {addr} ({location})\n")
+                logging.info(f"Blocked IP {addr} after {ip_counters[addr]} attempts")
+
+        active_clients -= 1
+        log_csv(addr, location, "Disconnected", config)
+
+async def main():
+    config = load_config('config.txt')
+    logging.basicConfig(
+        filename=config['LOGFILE'],
+        level=logging.INFO,
+        format='[%(asctime)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    apply_resource_limits(config)
+    load_blocked_ips()
+
+    server = await asyncio.start_server(
+        lambda r, w: handle_client(r, w, config),
+        '0.0.0.0',
+        int(config['PORT'])
+    )
+
+    print(f"Pandemonium running on port {config['PORT']}")
+    async with server:
+        await server.serve_forever()
+if __name__ == "__main__":
+    if not os.path.exists(".venv"):
+        print("[+] Preparing Pandemonium for first use...")
+
+        try:
+            import ensurepip
+        except ImportError:
+            print("[!] python3-venv is missing. Attempting to install...")
+            try:
+                subprocess.check_call(["apt-get", "update"])
+                subprocess.check_call(["apt-get", "install", "-y", "python3-venv"])
+            except Exception:
+                print("✖️  Failed to install python3-venv. Please run:\n  apt install python3-venv")
+                sys.exit(1)
+
+        print("[+] Creating virtual environment...")
+        subprocess.check_call(["python3", "-m", "venv", ".venv"])
+
+        print("[+] Installing pip and geoip2...")
+        subprocess.check_call([".venv/bin/python", "-m", "pip", "install", "--upgrade", "pip"])
+        subprocess.check_call([".venv/bin/python", "-m", "pip", "install", "-r", "requirements.txt"])
+
+        with open("startpandemonium.sh", "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write("cd /opt/Pandemonium\n")
+            f.write(". .venv/bin/activate\n")
+            f.write("nohup ./pandemonium > output.log 2>&1 &\n")
+
+        with open("stop-pandemonium.sh", "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write("echo \"[*] Stopping Pandemonium...\"\n")
+            f.write("pkill -f pandemonium && echo \"[✓] Pandemonium stopped.\" || echo \"[!] No running Pandemonium process found.\"\n")
+            f.write("echo \"[*] Active DROP rules from iptables:\"\n")
+            f.write("iptables -L INPUT -n --line-numbers | grep DROP || echo \"[✓] No DROP rules found.\"\n")
+
+        with open("reset-blocks.sh", "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write("echo \"[*] Removing all DROP rules from iptables (manually added or by Pandemonium)...\"\n")
+            f.write("for line in $(iptables -L INPUT -n --line-numbers | grep 'DROP' | tac | awk '{print $1}'); do\n")
+            f.write("    iptables -D INPUT $line\n")
+            f.write("done\n")
+            f.write("echo \"[✓] All DROP rules removed.\"\n")
+            f.write("> /opt/Pandemonium/blocked_ips.txt\n")
+            f.write("echo \"[✓] Cleared blocked_ips.txt\"\n")
+
+        with open("status-pandemonium.sh", "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write("CONFIG=\"/opt/Pandemonium/config.txt\"\n")
+            f.write("PORT=$(grep '^PORT=' \"$CONFIG\" | cut -d '=' -f2)\n")
+            f.write("PROCESS=$(pgrep -f \"./pandemonium\")\n")
+            f.write("BLOCKED=$(wc -l < /opt/Pandemonium/blocked_ips.txt 2>/dev/null)\n")
+            f.write("LASTLOG=$(tail -n 1 /opt/Pandemonium/pandemonium.log 2>/dev/null)\n")
+            f.write("echo -e \"\\033[1;33mPandemonium Status:\\033[0m\"\n")
+            f.write("if [ -z \"$PROCESS\" ]; then\n")
+            f.write("  echo -e \" Status: \\033[0;31mNot running\\033[0m\"\n")
+            f.write("else\n")
+            f.write("  echo -e \" Status: \\033[0;32mRunning (PID: $PROCESS)\\033[0m\"\n")
+            f.write("fi\n")
+            f.write("echo -e \" Port:   ${PORT:-unknown}\"\n")
+            f.write("echo -e \" Blocked IPs: ${BLOCKED:-0}\"\n")
+            f.write("echo -e \" Last log: ${LASTLOG:-No log found}\"\n")
+
+        with open("guide.txt", "w") as g:
+            g.write("""\
+===============================
+Pandemonium Configuration Guide
+===============================
+
+This file was autogenerated on first run.
+
+CONFIGURATION FILE: config.txt
+------------------------------
+PORT             = Port to listen on (default: 2222)
+MODE             = 'block' or 'endless'
+                   block   → IP blocked after MAX_CONNECTIONS
+                   endless → connection kept open with repeated lines
+DELAY            = Delay between lines (in ms) [endless mode]
+MAX_LINE_LENGTH  = How long each line is [endless mode]
+MAX_CONNECTIONS  = How many connections before blocking (only in block mode)
+TIMEOUT          = Max time to keep a connection alive
+MAX_CLIENTS      = Max simultaneous connections
+CPU_LIMIT        = Soft CPU limit (%)
+MEMORY_LIMIT     = Max memory in MB
+LOGFILE          = Path to log file
+CSV_LOG          = Path to CSV event log
+DB               = Path to GeoLite2-City.mmdb file
+
+START / STOP / STATUS / RESET
+-----------------------------
+Start:   sudo /opt/Pandemonium/startpandemonium.sh
+Stop:    sudo /opt/Pandemonium/stop-pandemonium.sh
+Reset:   sudo /opt/Pandemonium/reset-blocks.sh
+Status:  sudo /opt/Pandemonium/status-pandemonium.sh
+
+MONITORING
+----------
+tail -f /opt/Pandemonium/pandemonium.log
+tail -f /opt/Pandemonium/events.csv
+cat     /opt/Pandemonium/blocked_ips.txt
+
+Add GeoIP DB:
+Download GeoLite2-City.mmdb from MaxMind and place it in:
+  /opt/Pandemonium/
+""")
+
+        for script in ["startpandemonium.sh", "stop-pandemonium.sh", "reset-blocks.sh", "status-pandemonium.sh"]:
+            os.chmod(script, 0o755)
+
+        print("\n✅ Pandemonium is now installed and all scripts are generated.")
+        print("▶️  Start with:\n   sudo /opt/Pandemonium/startpandemonium.sh")
+        print("🛑  Stop with:\n   sudo /opt/Pandemonium/stop-pandemonium.sh")
+        print("♻️  Reset blocks with:\n   sudo /opt/Pandemonium/reset-blocks.sh")
+        print("📊  Status:\n   sudo /opt/Pandemonium/status-pandemonium.sh")
+        print("📘  Configuration guide:\n   nano /opt/Pandemonium/guide.txt")
+        sys.exit(0)
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down Pandemonium")
